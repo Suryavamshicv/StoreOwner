@@ -1,0 +1,132 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Helpers
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(ownerId) { return isSignedIn() && request.auth.uid == ownerId; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    // Owner Profiles
+    match /owners/{ownerId} {
+      function isValidOwner(data) {
+        return data.uid == request.auth.uid &&
+               data.email is string &&
+               data.subscriptionStatus in ['inactive', 'active', 'trial'] &&
+               (!('lowStockThreshold' in data) || data.lowStockThreshold is number) &&
+               (!('customCheckoutUrl' in data) || (data.customCheckoutUrl is string && data.customCheckoutUrl.size() <= 500));
+      }
+
+      allow get: if isOwner(ownerId);
+      allow create: if isOwner(ownerId) && isValidOwner(incoming());
+      allow update: if isOwner(ownerId) && isValidOwner(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['storeName', 'location', 'paymentUPI', 'payoutAccount', 'subscriptionStatus', 'subscriptionEndDate', 'lowStockThreshold', 'customCheckoutUrl'])
+      );
+    }
+
+    // Product Categories
+    match /product_categories/{categoryId} {
+      function isValidCategory(data) {
+        return data.ownerId == request.auth.uid &&
+               data.category_name is string && data.category_name.size() > 0 && data.category_name.size() <= 100 &&
+               (!('description' in data) || (data.description is string && data.description.size() <= 1000));
+      }
+
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidCategory(incoming()) && isValidId(categoryId);
+      allow update: if isSignedIn() && isOwner(existing().ownerId) && isValidCategory(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['category_name', 'description', 'updatedAt'])
+      );
+      allow delete: if isSignedIn() && isOwner(existing().ownerId);
+    }
+
+    // Supermarket Products
+    match /supermarket_products/{productId} {
+      function isValidProduct(data) {
+        return data.ownerId == request.auth.uid &&
+               data.product_name is string && data.product_name.size() > 0 && data.product_name.size() <= 255 &&
+               data.retail_price is number && data.retail_price >= 0 &&
+               data.stock_quantity is number && data.stock_quantity >= 0 &&
+               (!('brand_name' in data) || (data.brand_name is string && data.brand_name.size() <= 100)) &&
+               (!('product_description' in data) || (data.product_description is string && data.product_description.size() <= 2000)) &&
+               (!('category_id' in data) || (data.category_id is string && data.category_id.size() <= 128)) &&
+               (!('category_name' in data) || (data.category_name is string && data.category_name.size() <= 100)) &&
+               (!('qrCode' in data) || (data.qrCode is string && data.qrCode.size() <= 512)) &&
+               (!('barcode' in data) || (data.barcode is string && data.barcode.size() <= 100)) &&
+               (!('image_url' in data) || (data.image_url is string && data.image_url.size() <= 512));
+      }
+
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidProduct(incoming()) && isValidId(productId);
+      allow update: if isSignedIn() && isOwner(existing().ownerId) && isValidProduct(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['product_name', 'brand_name', 'retail_price', 'stock_quantity', 'product_description', 'category_id', 'category_name', 'qrCode', 'barcode', 'code_type', 'image_url', 'updated_at', 'updatedAt'])
+      );
+      allow delete: if isSignedIn() && isOwner(existing().ownerId);
+    }
+
+    // Scannable Codes (B-Tree indexed lookup table for QR & Barcodes)
+    match /scannable_codes/{codeId} {
+      function isValidScannableCode(data) {
+        return data.ownerId == request.auth.uid &&
+               data.product_id is string && isValidId(data.product_id) &&
+               data.code_payload is string && data.code_payload.size() > 0 && data.code_payload.size() <= 512 &&
+               data.code_type in ['QR_CODE', 'EAN_13', 'UPC', 'CODE_128'] &&
+               data.is_active is bool;
+      }
+
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidScannableCode(incoming()) && isValidId(codeId);
+      allow update: if isSignedIn() && isOwner(existing().ownerId) && isValidScannableCode(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['code_payload', 'code_type', 'is_active', 'product_id'])
+      );
+      allow delete: if isSignedIn() && isOwner(existing().ownerId);
+    }
+
+    // Legacy Inventory Table
+    match /inventory/{itemId} {
+      function isValidItem(data) {
+        return data.ownerId == request.auth.uid &&
+               data.name is string && data.name.size() <= 255 &&
+               data.price is number && data.price >= 0 &&
+               data.stock is number && data.stock >= 0 &&
+               (!('qrCode' in data) || (data.qrCode is string && data.qrCode.size() <= 512)) &&
+               (!('barcode' in data) || (data.barcode is string && data.barcode.size() <= 100)) &&
+               (!('brand' in data) || (data.brand is string && data.brand.size() <= 100)) &&
+               (!('description' in data) || (data.description is string && data.description.size() <= 2000)) &&
+               (!('code_type' in data) || data.code_type in ['QR_CODE', 'EAN_13', 'UPC', 'CODE_128']);
+      }
+
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn() && isValidItem(incoming()) && isValidId(itemId);
+      allow update: if isSignedIn() && isOwner(existing().ownerId) && isValidItem(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'price', 'stock', 'category', 'brand', 'description', 'qrCode', 'barcode', 'code_type', 'updatedAt'])
+      );
+      allow delete: if isSignedIn() && isOwner(existing().ownerId);
+    }
+
+    // Sales Records
+    match /sales/{saleId} {
+      function isValidSale(data) {
+        return data.ownerId is string &&
+               data.total is number &&
+               data.paymentStatus in ['pending', 'completed', 'failed'] &&
+               data.createdAt is timestamp;
+      }
+
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow get: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && (isOwner(existing().ownerId) || isOwner(incoming().ownerId));
+    }
+  }
+}

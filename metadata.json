@@ -1,0 +1,6 @@
+{
+  "name": "StoreOwner - Inventory & Sales",
+  "description": "Premium mobile management for supermarket owners with automated checkout, subscription billing, and real-time inventory tracking.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

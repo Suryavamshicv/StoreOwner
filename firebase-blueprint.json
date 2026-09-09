@@ -1,0 +1,134 @@
+{
+  "entities": {
+    "Owner": {
+      "title": "Store Owner",
+      "description": "Store owner profile, checkout URL, and subscription status",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "storeName": { "type": "string" },
+        "location": { "type": "string" },
+        "paymentUPI": { "type": "string" },
+        "payoutAccount": { "type": "string" },
+        "subscriptionStatus": { "enum": ["inactive", "active", "trial"] },
+        "subscriptionEndDate": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lowStockThreshold": { "type": "number" },
+        "customCheckoutUrl": { "type": "string" }
+      },
+      "required": ["uid", "email", "subscriptionStatus"]
+    },
+    "ProductCategory": {
+      "title": "Product Category",
+      "description": "Category for organizing supermarket products",
+      "type": "object",
+      "properties": {
+        "category_id": { "type": "string" },
+        "category_name": { "type": "string", "maxLength": 100 },
+        "description": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["category_name", "ownerId"]
+    },
+    "SupermarketProduct": {
+      "title": "Supermarket Product",
+      "description": "Main supermarket product inventory item",
+      "type": "object",
+      "properties": {
+        "product_id": { "type": "string" },
+        "category_id": { "type": "string" },
+        "category_name": { "type": "string", "maxLength": 100 },
+        "product_name": { "type": "string", "maxLength": 255 },
+        "brand_name": { "type": "string", "maxLength": 100 },
+        "retail_price": { "type": "number" },
+        "stock_quantity": { "type": "number" },
+        "product_description": { "type": "string" },
+        "image_url": { "type": "string", "maxLength": 512 },
+        "qrCode": { "type": "string", "maxLength": 512 },
+        "barcode": { "type": "string", "maxLength": 100 },
+        "code_type": { "enum": ["QR_CODE", "EAN_13", "UPC", "CODE_128"] },
+        "ownerId": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["product_name", "retail_price", "stock_quantity", "ownerId"]
+    },
+    "ScannableCode": {
+      "title": "Scannable Code",
+      "description": "Dedicated scannable barcode or QR identifier for instantaneous scan lookup",
+      "type": "object",
+      "properties": {
+        "code_id": { "type": "string" },
+        "product_id": { "type": "string" },
+        "code_payload": { "type": "string", "maxLength": 512 },
+        "code_type": { "enum": ["QR_CODE", "EAN_13", "UPC", "CODE_128"] },
+        "is_active": { "type": "boolean" },
+        "ownerId": { "type": "string" },
+        "created_at": { "type": "string", "format": "date-time" }
+      },
+      "required": ["product_id", "code_payload", "code_type", "is_active", "ownerId"]
+    },
+    "InventoryItem": {
+      "title": "Inventory Item",
+      "description": "Product in the supermarket inventory (legacy compatible)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "price": { "type": "number" },
+        "stock": { "type": "number" },
+        "category": { "type": "string" },
+        "qrCode": { "type": "string" },
+        "barcode": { "type": "string" },
+        "brand": { "type": "string" },
+        "description": { "type": "string" },
+        "code_type": { "enum": ["QR_CODE", "EAN_13", "UPC", "CODE_128"] },
+        "ownerId": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "price", "stock", "ownerId"]
+    },
+    "Sale": {
+      "title": "Sale Record",
+      "description": "Recorded sale/payment from the auto-checkout web app",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "total": { "type": "number" },
+        "itemsCount": { "type": "number" },
+        "paymentStatus": { "enum": ["pending", "completed", "failed"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["ownerId", "total", "paymentStatus", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/owners/{ownerId}": {
+      "schema": "Owner",
+      "description": "Store owner profiles"
+    },
+    "/product_categories/{categoryId}": {
+      "schema": "ProductCategory",
+      "description": "Categories for supermarket products"
+    },
+    "/supermarket_products/{productId}": {
+      "schema": "SupermarketProduct",
+      "description": "Main product inventory catalog"
+    },
+    "/scannable_codes/{codeId}": {
+      "schema": "ScannableCode",
+      "description": "Fast scannable QR and Barcode lookup records"
+    },
+    "/inventory/{itemId}": {
+      "schema": "InventoryItem",
+      "description": "Global inventory (partitioned by ownerId)"
+    },
+    "/sales/{saleId}": {
+      "schema": "Sale",
+      "description": "Global sales records (partitioned by ownerId)"
+    }
+  }
+}
