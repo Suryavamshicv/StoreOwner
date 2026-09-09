@@ -1,5 +1,5 @@
 import type { Request, Response } from 'express';
-import { startServer } from '../server';
+import { startServer } from '../server.ts';
 
 const appPromise = startServer();
 
