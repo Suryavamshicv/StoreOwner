@@ -22,14 +22,6 @@ export interface UserAuthContext {
   uid?: string;
 }
 
-export interface AuthResponse {
-  user: AppUser;
-  role: UserRole;
-  isAdmin: boolean;
-  isSubscribed: boolean;
-  subscription: StoreSubscription | null;
-}
-
 let globalAuthContext: UserAuthContext = {
   role: 'store_owner',
   isSubscribed: false,
@@ -44,42 +36,6 @@ export function setGlobalAuthContext(ctx: Partial<UserAuthContext>) {
 
 export function getGlobalAuthContext(): UserAuthContext {
   return globalAuthContext;
-}
-
-async function authRequest(path: string, body?: Record<string, unknown>): Promise<AuthResponse> {
-  const res = await fetch(path, {
-    method: body ? 'POST' : 'GET',
-    credentials: 'include',
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Authentication failed' }));
-    throw new Error(err.error || 'Authentication failed');
-  }
-  return await res.json();
-}
-
-export function registerWithPostgres(data: {
-  email: string;
-  password: string;
-  full_name?: string;
-  phone?: string;
-  store_name?: string;
-}): Promise<AuthResponse> {
-  return authRequest('/api/auth/register', data);
-}
-
-export function loginWithPostgres(email: string, password: string): Promise<AuthResponse> {
-  return authRequest('/api/auth/login', { email, password });
-}
-
-export function getCurrentPostgresSession(): Promise<AuthResponse> {
-  return authRequest('/api/auth/session');
-}
-
-export async function logoutFromPostgres(): Promise<void> {
-  await authRequest('/api/auth/logout', {});
 }
 
 function getAuthHeaders(override?: UserAuthContext): Record<string, string> {
@@ -105,7 +61,7 @@ export async function getPostgresStatus(): Promise<PostgresStatus> {
     console.error('Failed to fetch Postgres status:', err);
     return {
       connected: false,
-      host: 'db.prisma.io',
+      host: 'PostgreSQL Database',
       database: 'postgres',
       counts: { products: 0, scannableCodes: 0, categories: 0, users: 0, vendors: 0, subscriptions: 0 }
     };
@@ -288,6 +244,7 @@ export async function createAppUser(userData: {
   phone?: string;
   store_name?: string;
   firebase_uid?: string;
+  password?: string;
 }): Promise<AppUser> {
   const res = await fetch('/api/users', {
     method: 'POST',
@@ -296,14 +253,14 @@ export async function createAppUser(userData: {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Failed to create user' }));
-    throw new Error(err.error || 'Failed to create user');
+    throw new Error(err.error || 'Failed to create user in PostgreSQL');
   }
   return await res.json();
 }
 
 export async function updateAppUser(
   userId: number,
-  data: Partial<AppUser>
+  data: Partial<AppUser> & { password?: string }
 ): Promise<AppUser> {
   const res = await fetch(`/api/users/${userId}`, {
     method: 'PATCH',
@@ -312,9 +269,20 @@ export async function updateAppUser(
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Failed to update user' }));
-    throw new Error(err.error || 'Failed to update user');
+    throw new Error(err.error || 'Failed to update user in PostgreSQL');
   }
   return await res.json();
+}
+
+export async function deleteAppUser(userId: number): Promise<void> {
+  const res = await fetch(`/api/users/${userId}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders()
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to delete user' }));
+    throw new Error(err.error || 'Failed to delete user');
+  }
 }
 
 // ============================================================================
@@ -377,8 +345,12 @@ export async function deleteVendor(vendorId: number): Promise<void> {
 // ============================================================================
 // SUBSCRIPTION MANAGEMENT API CLIENT
 // ============================================================================
-export async function fetchSubscriptions(): Promise<StoreSubscription[]> {
-  const res = await fetch('/api/subscriptions', { headers: getAuthHeaders() });
+export async function fetchSubscriptions(filters?: { user_id?: number; firebase_uid?: string }): Promise<StoreSubscription[]> {
+  const params = new URLSearchParams();
+  if (filters?.user_id) params.set('user_id', String(filters.user_id));
+  if (filters?.firebase_uid) params.set('firebase_uid', filters.firebase_uid);
+  const queryStr = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`/api/subscriptions${queryStr}`, { headers: getAuthHeaders() });
   if (!res.ok) throw new Error('Failed to fetch subscriptions from database');
   return await res.json();
 }
@@ -424,42 +396,98 @@ export async function updateSubscription(
   return await res.json();
 }
 
-export async function createRazorpayOrder(planId: 'basic' | 'pro'): Promise<{
-  keyId: string;
-  plan: { name: string; price: number; inventoryLimit: number };
-  order: { id: string; amount: number; currency: string };
+// PostgreSQL direct login validation against app_users table
+export async function loginWithPostgres(credentials: {
+  identifier?: string;
+  email?: string;
+  phone?: string;
+  password: string;
+}): Promise<{
+  success: boolean;
+  user: AppUser;
+  role: UserRole;
+  isAdmin: boolean;
+  isSubscribed: boolean;
+  subscription: StoreSubscription | null;
 }> {
-  const res = await fetch('/api/payments/razorpay/order', {
+  const res = await fetch('/api/auth/login', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({ planId })
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(credentials)
   });
+
+  const data = await res.json().catch(() => ({ error: 'Login request failed' }));
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Unable to start payment' }));
-    throw new Error(err.error || 'Unable to start payment');
+    throw new Error(data.error || 'Failed to validate credentials against PostgreSQL app_users');
   }
-  return await res.json();
+
+  setGlobalAuthContext({
+    role: data.role,
+    isSubscribed: data.isSubscribed,
+    email: data.user.email,
+    phone: data.user.phone,
+    uid: data.user.firebase_uid || `pg_user_${data.user.user_id}`
+  });
+
+  return data;
 }
 
-export async function verifyRazorpayPayment(data: {
-  planId: 'basic' | 'pro';
-  razorpay_order_id: string;
-  razorpay_payment_id: string;
-  razorpay_signature: string;
-}): Promise<{ success: boolean; subscription: StoreSubscription }> {
-  const res = await fetch('/api/payments/razorpay/verify', {
+// PostgreSQL direct user registration creating user in app_users table
+export async function registerWithPostgres(registrationData: {
+  email: string;
+  password: string;
+  full_name?: string;
+  store_name?: string;
+  phone?: string;
+}): Promise<{
+  success: boolean;
+  user: AppUser;
+  role: UserRole;
+  isAdmin: boolean;
+  isSubscribed: boolean;
+  subscription: StoreSubscription | null;
+}> {
+  const res = await fetch('/api/auth/register', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify(data)
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(registrationData)
   });
+
+  const data = await res.json().catch(() => ({ error: 'Registration request failed' }));
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Payment verification failed' }));
-    throw new Error(err.error || 'Payment verification failed');
+    throw new Error(data.error || 'Failed to register account in PostgreSQL app_users');
   }
-  return await res.json();
+
+  setGlobalAuthContext({
+    role: data.role,
+    isSubscribed: data.isSubscribed,
+    email: data.user.email,
+    phone: data.user.phone,
+    uid: data.user.firebase_uid || `pg_user_${data.user.user_id}`
+  });
+
+  return data;
 }
 
 // Auth sync helper
+export async function resetPasswordWithPostgres(params: {
+  identifier?: string;
+  email?: string;
+  phone?: string;
+  newPassword: string;
+}): Promise<{ success: boolean; message: string }> {
+  const res = await fetch('/api/auth/reset-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params)
+  });
+  const data = await res.json().catch(() => ({ error: 'Password reset request failed' }));
+  if (!res.ok) {
+    throw new Error(data.error || 'Failed to reset password in database');
+  }
+  return data;
+}
+
 export async function syncAuthUser(params: {
   firebase_uid?: string;
   email: string;

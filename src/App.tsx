@@ -3,8 +3,7 @@ import {
   BrowserRouter as Router, 
   Routes, 
   Route, 
-  Navigate, 
-  useNavigate 
+  Navigate 
 } from 'react-router-dom';
 import { useAuth } from './context/AuthContext';
 import Login from './components/Login';
@@ -15,7 +14,7 @@ import Sales from './components/Sales';
 import QRGenerator from './components/QRGenerator';
 import StoreProfile from './components/StoreProfile';
 import AdminPortal from './components/AdminPortal';
-import { motion, AnimatePresence } from 'motion/react';
+import { motion } from 'motion/react';
 
 export default function App() {
   const { user, loading, isSubscribed, isAdmin, refreshAuth } = useAuth();
@@ -43,39 +42,43 @@ export default function App() {
     <Router>
       <div className="min-h-screen bg-netflix-black">
         <Routes>
-          <Route path="/auth" element={!user ? <Login /> : <Navigate to={isSubscribed ? "/dashboard" : "/subscribe"} />} />
+          <Route path="/auth" element={!user ? <Login /> : <Navigate to={isAdmin ? "/admin" : (isSubscribed ? "/dashboard" : "/subscription")} />} />
           
           <Route 
+            path="/subscription" 
+            element={user ? <Subscription onSuccess={() => refreshAuth()} /> : <Navigate to="/auth" />} 
+          />
+          <Route 
             path="/subscribe" 
-            element={user ? (isSubscribed ? <Navigate to="/dashboard" /> : <Subscription onSuccess={refreshAuth} />) : <Navigate to="/auth" />} 
+            element={<Navigate to="/subscription" replace />} 
           />
           
           <Route 
             path="/dashboard" 
-            element={user && isSubscribed ? <Dashboard /> : <Navigate to={!user ? "/auth" : "/subscribe"} />} 
+            element={user && (isSubscribed || isAdmin) ? <Dashboard /> : <Navigate to={!user ? "/auth" : "/subscription"} />} 
           />
           <Route 
             path="/inventory" 
-            element={user ? <Inventory /> : <Navigate to="/auth" />} 
+            element={user && (isSubscribed || isAdmin) ? <Inventory /> : <Navigate to={!user ? "/auth" : "/subscription"} />} 
           />
           <Route 
             path="/sales" 
-            element={user && isSubscribed ? <Sales /> : <Navigate to={!user ? "/auth" : "/subscribe"} />} 
+            element={user && (isSubscribed || isAdmin) ? <Sales /> : <Navigate to={!user ? "/auth" : "/subscription"} />} 
           />
           <Route 
             path="/qr" 
-            element={user && isSubscribed ? <QRGenerator /> : <Navigate to={!user ? "/auth" : "/subscribe"} />} 
+            element={user && (isSubscribed || isAdmin) ? <QRGenerator /> : <Navigate to={!user ? "/auth" : "/subscription"} />} 
           />
           <Route 
             path="/profile" 
-            element={user ? <StoreProfile /> : <Navigate to="/auth" />} 
+            element={user && (isSubscribed || isAdmin) ? <StoreProfile /> : <Navigate to={!user ? "/auth" : "/subscription"} />} 
           />
           <Route 
             path="/admin" 
-            element={user && (isAdmin || isSubscribed) ? <AdminPortal /> : <Navigate to={!user ? "/auth" : "/subscribe"} />} 
+            element={user && (isAdmin || isSubscribed) ? <AdminPortal /> : <Navigate to={!user ? "/auth" : "/subscription"} />} 
           />
 
-          <Route path="/" element={<Navigate to={user ? (isSubscribed ? "/dashboard" : "/inventory") : "/auth"} />} />
+          <Route path="/" element={<Navigate to={user ? (isAdmin ? "/admin" : (isSubscribed ? "/dashboard" : "/subscription")) : "/auth"} />} />
         </Routes>
       </div>
     </Router>

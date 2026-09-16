@@ -1,13 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import Layout from './Layout';
+import { doc, getDoc, updateDoc } from 'firebase/firestore';
+import { db, auth } from '../lib/firebase';
 import { motion } from 'motion/react';
-import { Store, MapPin, Save, ShieldCheck, CreditCard, Landmark, Globe, Hash, RefreshCw, Check, FileText } from 'lucide-react';
-import { formatStoreId, generateRandomStoreId } from '../lib/storeUtils';
-import { updateAppUser } from '../lib/postgresApi';
+import { Store, MapPin, Save, ShieldCheck, CreditCard, Landmark, Globe, Hash, RefreshCw, Check, FileText, LogOut, User, Phone, Mail, UserCheck } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { OperationType, handleFirestoreError } from '../lib/utils';
+import { formatStoreId, generateRandomStoreId } from '../lib/storeUtils';
 
 export default function StoreProfile() {
-  const { appUser, refreshAuth } = useAuth();
+  const { user, appUser, isAdmin, signOut } = useAuth();
   const envBaseUrl = import.meta.env.VITE_QR_BASE_URL || 'https://quickscannerver1.vercel.app';
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -29,22 +31,41 @@ export default function StoreProfile() {
 
   useEffect(() => {
     async function fetchProfile() {
+      if (!auth.currentUser) return;
       try {
-        setFormData(prev => ({
-          ...prev,
-          storeName: appUser?.store_name || '',
-          storeCode: formatStoreId(appUser?.firebase_uid || String(appUser?.user_id || '')),
-          businessName: appUser?.full_name || '',
-          tradeName: appUser?.store_name || ''
-        }));
+        const docRef = doc(db, 'owners', auth.currentUser.uid);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          setFormData({
+            storeName: data.storeName || data.businessName || '',
+            storeCode: formatStoreId(data.storeCode || auth.currentUser.uid),
+            location: data.location || data.address || '',
+            businessName: data.businessName || '',
+            tradeName: data.tradeName || '',
+            gstin: data.gstin || '',
+            pan: data.pan || '',
+            fssai: data.fssai || '',
+            state: data.state || 'Karnataka',
+            pincode: data.pincode || '',
+            paymentUPI: data.paymentUPI || '',
+            payoutAccount: data.payoutAccount || '',
+            customCheckoutUrl: data.customCheckoutUrl || ''
+          });
+        } else {
+          setFormData(prev => ({
+            ...prev,
+            storeCode: formatStoreId(auth.currentUser?.uid)
+          }));
+        }
       } catch (e) {
-        console.error('Failed to load PostgreSQL profile:', e);
+        handleFirestoreError(e, OperationType.GET, 'owners');
       } finally {
         setLoading(false);
       }
     }
     fetchProfile();
-  }, [appUser]);
+  }, []);
 
   const handleRegenerateCode = () => {
     const newCode = generateRandomStoreId();
@@ -58,20 +79,30 @@ export default function StoreProfile() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!appUser?.user_id) return;
+    if (!auth.currentUser) return;
     setSaving(true);
     try {
-      const finalStoreCode = formatStoreId(formData.storeCode || String(appUser.user_id));
-      await updateAppUser(appUser.user_id, {
-        full_name: formData.businessName,
-        store_name: formData.tradeName || formData.storeName,
-        phone: appUser.phone
+      const docRef = doc(db, 'owners', auth.currentUser.uid);
+      const finalStoreCode = formatStoreId(formData.storeCode || auth.currentUser.uid);
+      await updateDoc(docRef, {
+        storeName: formData.storeName,
+        storeCode: finalStoreCode,
+        location: formData.location,
+        businessName: formData.businessName,
+        tradeName: formData.tradeName,
+        gstin: formData.gstin.toUpperCase(),
+        pan: formData.pan.toUpperCase(),
+        fssai: formData.fssai,
+        state: formData.state,
+        pincode: formData.pincode,
+        paymentUPI: formData.paymentUPI,
+        payoutAccount: formData.payoutAccount,
+        customCheckoutUrl: formData.customCheckoutUrl.trim()
       });
-      await refreshAuth();
       setFormData(prev => ({ ...prev, storeCode: finalStoreCode }));
-      alert('Store profile updated successfully!');
+      alert('Compliance and Store Profile updated successfully!');
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Failed to update store profile');
+      handleFirestoreError(e, OperationType.UPDATE, 'owners');
     } finally {
       setSaving(false);
     }
@@ -302,6 +333,75 @@ export default function StoreProfile() {
             </div>
           </div>
         </form>
+
+        {/* User Account & Session Controls */}
+        {(() => {
+          const fallbackAuth = JSON.parse(localStorage.getItem('store_owner_fallback_auth') || '{}');
+          const storedPhone = localStorage.getItem('store_owner_phone') || fallbackAuth.phone || appUser?.phone || (user?.phoneNumber?.replace(/\D/g, '')) || '';
+          const isUserAdmin = isAdmin || storedPhone.includes('9739765357') || user?.email?.includes('9739765357');
+
+          const properUserName = 
+            formData.businessName ||
+            formData.tradeName ||
+            appUser?.full_name || 
+            user?.displayName || 
+            fallbackAuth.businessName || 
+            (isUserAdmin ? 'Admin (9739765357)' : storedPhone ? `Merchant (${storedPhone})` : 'Store Owner');
+
+          return (
+            <div className="glass-card p-6 border border-slate-200/80 rounded-3xl space-y-5 bg-white/90 shadow-sm">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-100">
+                <div className="flex items-center gap-3.5">
+                  <div className="w-12 h-12 rounded-2xl bg-slate-900 text-white flex items-center justify-center font-black text-lg shadow-md">
+                    {properUserName.charAt(0).toUpperCase()}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h4 className="text-base font-black text-slate-900">{properUserName}</h4>
+                      <span className={`px-2 py-0.5 text-[9px] font-black uppercase tracking-wider rounded-md ${
+                        isUserAdmin ? 'bg-purple-100 text-purple-800 border border-purple-200' : 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                      }`}>
+                        {isUserAdmin ? 'Administrator' : 'Verified Store Owner'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-0.5 flex items-center gap-3">
+                      {storedPhone && (
+                        <span className="flex items-center gap-1 font-mono">
+                          <Phone className="w-3 h-3 text-slate-400" />
+                          +91 {storedPhone}
+                        </span>
+                      )}
+                      {(user?.email || appUser?.email) && (
+                        <span className="flex items-center gap-1">
+                          <Mail className="w-3 h-3 text-slate-400" />
+                          {user?.email || appUser?.email}
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => signOut()}
+                  className="px-5 py-2.5 bg-slate-100 hover:bg-red-50 text-slate-700 hover:text-red-600 rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer border border-slate-200 hover:border-red-200 shadow-xs"
+                >
+                  <LogOut className="w-4 h-4" />
+                  <span>Sign Out</span>
+                </button>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
+                <span className="font-mono text-[11px]">
+                  Store ID: <strong className="text-slate-800">{formData.storeCode || 'AUTO'}</strong>
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  Data secured with PostgreSQL backend & Firebase Authentication
+                </span>
+              </div>
+            </div>
+          );
+        })()}
       </div>
     </Layout>
   );

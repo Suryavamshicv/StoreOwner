@@ -203,16 +203,6 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
-            
-            <div className="mt-8 p-4 bg-netflix-red/5 border border-netflix-red/15 rounded-2xl flex items-center gap-4">
-              <div className="w-8 h-8 rounded-full bg-netflix-red flex items-center justify-center shadow-md">
-                <TrendingUp className="w-4 h-4 text-white" />
-              </div>
-              <div className="flex-1">
-                 <p className="text-xs font-bold text-slate-800">Direct Payouts: OK</p>
-                 <p className="text-[10px] text-slate-500 leading-tight">Funds appearing in your dashboard are being routed instantly.</p>
-              </div>
-            </div>
           </section>
 
           <section className="bg-white border border-slate-200/50 shadow-xs rounded-[2.5rem] p-8 flex flex-col justify-center items-center text-center space-y-6">

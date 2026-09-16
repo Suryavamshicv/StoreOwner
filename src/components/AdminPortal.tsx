@@ -5,6 +5,7 @@ import {
   fetchAppUsers, 
   createAppUser, 
   updateAppUser, 
+  deleteAppUser,
   fetchVendors, 
   createVendor, 
   updateVendor, 
@@ -71,6 +72,7 @@ export default function AdminPortal() {
   const [newUserRole, setNewUserRole] = useState<UserRole>('store_owner');
   const [newUserPhone, setNewUserPhone] = useState('');
   const [newUserStore, setNewUserStore] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
 
   // Vendor form state
   const [vendorForm, setVendorForm] = useState({
@@ -132,16 +134,35 @@ export default function AdminPortal() {
         full_name: newUserName.trim(),
         role: newUserRole,
         phone: newUserPhone.trim(),
-        store_name: newUserStore.trim()
+        store_name: newUserStore.trim(),
+        password: newUserPassword.trim() || undefined
       });
       setIsUserModalOpen(false);
       setNewUserEmail('');
       setNewUserName('');
       setNewUserPhone('');
       setNewUserStore('');
+      setNewUserPassword('');
       await loadAllAdminData();
     } catch (err: any) {
       alert(err.message || 'Failed to create user');
+    }
+  };
+
+  // Handler: Set / Reset user password directly in PostgreSQL app_users
+  const handleSetUserPassword = async (userItem: AppUser) => {
+    const promptPass = window.prompt(`Enter new password for ${userItem.email} (min 6 characters):`);
+    if (!promptPass) return;
+    if (promptPass.length < 6) {
+      alert('Password must be at least 6 characters long.');
+      return;
+    }
+    try {
+      await updateAppUser(userItem.user_id!, { password: promptPass });
+      alert(`Password updated successfully in PostgreSQL app_users for ${userItem.email}.`);
+      await loadAllAdminData();
+    } catch (err: any) {
+      alert(err.message || 'Failed to update user password in database.');
     }
   };
 
@@ -163,6 +184,20 @@ export default function AdminPortal() {
       setUsers(prev => prev.map(u => u.user_id === userItem.user_id ? { ...u, is_active: updatedStatus } : u));
     } catch (err: any) {
       alert(err.message || 'Failed to update user status');
+    }
+  };
+
+  // Handler: Delete User
+  const handleDeleteUser = async (userItem: AppUser) => {
+    if (!window.confirm(`Delete user "${userItem.email}" from PostgreSQL? This also clears any associated subscriptions.`)) {
+      return;
+    }
+    try {
+      await deleteAppUser(userItem.user_id);
+      setUsers(prev => prev.filter(u => u.user_id !== userItem.user_id));
+      await loadAllAdminData();
+    } catch (err: any) {
+      alert(err.message || 'Failed to delete user');
     }
   };
 
@@ -472,7 +507,9 @@ CREATE TABLE IF NOT EXISTS store_subscriptions (
                   <span>Connected</span>
                   <CheckCircle2 className="w-5 h-5 text-emerald-600 inline" />
                 </div>
-                <p className="text-xs text-slate-400 font-mono mt-1">db.prisma.io:5432/postgres</p>
+                <p className="text-xs text-slate-400 font-mono mt-1">
+                  {pgStatus?.host ? `${pgStatus.host}/${pgStatus.database || 'postgres'}` : 'PostgreSQL Database'}
+                </p>
               </div>
 
               <div className="bg-white p-5 rounded-3xl border border-slate-200 shadow-xs">
@@ -604,8 +641,8 @@ CREATE TABLE IF NOT EXISTS store_subscriptions (
               {/* Code block */}
               <div className="bg-slate-900 text-emerald-400 p-4 rounded-2xl font-mono text-xs overflow-x-auto max-h-72">
                 <pre>{`-- Active Connection Parameters
-HOST: db.prisma.io:5432
-DATABASE: postgres
+HOST: ${pgStatus?.host || 'PostgreSQL Host'}
+DATABASE: ${pgStatus?.database || 'postgres'}
 SSL: required (rejectUnauthorized: false)
 DRIVER: pg (node-postgres v8.13.3)
 RBAC RULES:
@@ -641,6 +678,7 @@ RBAC RULES:
                       <th className="py-3.5 px-4">User</th>
                       <th className="py-3.5 px-4">Role</th>
                       <th className="py-3.5 px-4">Store Name</th>
+                      <th className="py-3.5 px-4">DB Password</th>
                       <th className="py-3.5 px-4">Subscription</th>
                       <th className="py-3.5 px-4">Status</th>
                       <th className="py-3.5 px-4 text-right">Actions</th>
@@ -677,6 +715,27 @@ RBAC RULES:
                             {u.store_name || 'Standard Store'}
                           </td>
                           <td className="py-3.5 px-4">
+                            <div className="flex items-center gap-1.5">
+                              {u.has_password ? (
+                                <span className="inline-flex items-center gap-1 text-[10px] font-bold bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full border border-emerald-200">
+                                  <Check className="w-2.5 h-2.5" />
+                                  Encrypted
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 text-[10px] font-medium bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full border border-amber-200">
+                                  Auto on Login
+                                </span>
+                              )}
+                              <button
+                                onClick={() => handleSetUserPassword(u)}
+                                title="Set / Change password in app_users table"
+                                className="text-[10px] text-slate-500 hover:text-slate-900 font-bold underline cursor-pointer"
+                              >
+                                Set
+                              </button>
+                            </div>
+                          </td>
+                          <td className="py-3.5 px-4">
                             {u.role === 'admin' ? (
                               <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-purple-50 text-purple-700 px-2 py-0.5 rounded-full border border-purple-200">
                                 Admin (All Access)
@@ -707,15 +766,24 @@ RBAC RULES:
                             </button>
                           </td>
                           <td className="py-3.5 px-4 text-right">
-                            <button
-                              onClick={() => {
-                                const nextRole = u.role === 'admin' ? 'store_owner' : 'admin';
-                                handleRoleChange(u.user_id, nextRole);
-                              }}
-                              className="text-xs text-slate-500 hover:text-slate-800 font-bold underline cursor-pointer"
-                            >
-                              {u.role === 'admin' ? 'Make Store Owner' : 'Make Admin'}
-                            </button>
+                            <div className="flex items-center justify-end gap-2.5">
+                              <button
+                                onClick={() => {
+                                  const nextRole = u.role === 'admin' ? 'store_owner' : 'admin';
+                                  handleRoleChange(u.user_id, nextRole);
+                                }}
+                                className="text-xs text-slate-500 hover:text-slate-800 font-bold underline cursor-pointer"
+                              >
+                                {u.role === 'admin' ? 'Make Store Owner' : 'Make Admin'}
+                              </button>
+                              <button
+                                onClick={() => handleDeleteUser(u)}
+                                title="Delete user"
+                                className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -1057,6 +1125,22 @@ RBAC RULES:
                     placeholder="Mega Mart Bangalore"
                     className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm font-medium focus:ring-2 focus:ring-slate-900 outline-none"
                   />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-1">
+                    Initial Password (Optional)
+                  </label>
+                  <input
+                    type="password"
+                    value={newUserPassword}
+                    onChange={(e) => setNewUserPassword(e.target.value)}
+                    placeholder="Min 6 chars (or set automatically on 1st login)"
+                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-sm font-medium focus:ring-2 focus:ring-slate-900 outline-none"
+                  />
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    Directly encrypted and stored into PostgreSQL <code className="font-mono text-slate-600">app_users.password_hash</code>
+                  </p>
                 </div>
 
                 <div className="flex justify-end gap-2 pt-2">

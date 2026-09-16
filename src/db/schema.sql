@@ -48,24 +48,12 @@ CREATE TABLE IF NOT EXISTS app_users (
     role VARCHAR(50) NOT NULL DEFAULT 'store_owner' CHECK (role IN ('admin', 'store_owner', 'vendor', 'cashier')),
     phone VARCHAR(50),
     store_name VARCHAR(255),
-    password_hash TEXT,
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_app_users_email ON app_users(email);
 CREATE INDEX IF NOT EXISTS idx_app_users_uid ON app_users(firebase_uid);
-
--- PostgreSQL-backed login sessions. Tokens are stored hashed and sent to the browser as HTTP-only cookies.
-CREATE TABLE IF NOT EXISTS auth_sessions (
-    session_id SERIAL PRIMARY KEY,
-    user_id INT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
-    token_hash VARCHAR(128) NOT NULL UNIQUE,
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash);
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
 
 -- 6. Vendor Management Table: vendors
 -- Tracks suppliers, contact points, supplied inventory categories, payment terms, and status
