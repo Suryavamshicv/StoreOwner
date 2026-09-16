@@ -1,6 +1,6 @@
 {
-  "installCommand": "npm install --include=optional",
-  "buildCommand": "npm run build:client",
+  "installCommand": "npm ci --include=optional",
+  "buildCommand": "npm install --no-save --include=optional @rollup/rollup-linux-x64-gnu@4.63.3 && npm run build:client",
   "outputDirectory": "dist",
   "functions": {
     "api/index.ts": {

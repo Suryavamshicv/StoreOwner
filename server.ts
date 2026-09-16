@@ -1,7 +1,6 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
@@ -1364,6 +1363,7 @@ export async function startServer() {
 
   // --- VITE MIDDLEWARE SETUP ---
   if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
