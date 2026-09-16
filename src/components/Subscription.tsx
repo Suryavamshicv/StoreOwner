@@ -344,7 +344,8 @@ export default function Subscription({ onSuccess }: Props) {
         plan_name: `${selectedPlan.name} (${billingCycle})`,
         billing_cycle: billingCycle,
         store_name: tradeName,
-        user_email: user?.email || undefined
+        user_email: user?.email || undefined,
+        phone: appUser?.phone || localStorage.getItem('store_owner_phone') || undefined
       });
 
       const orderId = orderRes?.order?.id || `order_rzp_${Date.now()}`;
@@ -359,6 +360,18 @@ export default function Subscription({ onSuccess }: Props) {
           description: `${selectedPlan.name} Subscription (${billingCycle})`,
           image: 'https://cdn-icons-png.flaticon.com/512/3081/3081840.png',
           order_id: orderId,
+          config: {
+            display: {
+              blocks: {
+                upi: {
+                  name: 'Pay using UPI',
+                  instruments: [{ method: 'upi' }]
+                }
+              },
+              sequence: ['block.upi', 'block.other'],
+              preferences: { show_default_blocks: true }
+            }
+          },
           prefill: {
             name: user?.displayName || tradeName,
             email: user?.email || 'admin@supermarket.in',

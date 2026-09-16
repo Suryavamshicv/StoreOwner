@@ -60,7 +60,7 @@ export async function getRazorpayConfig(): Promise<RazorpayConfig> {
     console.warn('Failed to load razorpay config:', err);
   }
   return {
-    keyId: import.meta.env.VITE_RAZORPAY_KEY_ID || 'rzp_test_51StoreOwnerDemo',
+    keyId: import.meta.env.VITE_RAZORPAY_KEY_ID || 'rzp_test_51StoreOwnerDemo', 
     isConfigured: false,
     currency: 'INR'
   };
@@ -77,16 +77,24 @@ export async function createRazorpayOrder(params: {
   billing_cycle: 'monthly' | 'yearly';
   store_name?: string;
   user_email?: string;
+  phone?: string;
 }): Promise<RazorpayOrderResponse> {
-  const res = await fetch('/api/razorpay/create-order', {
+  const res = await fetch('/api/payments/razorpay/order', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params)
+    credentials: 'same-origin',
+    body: JSON.stringify({ ...params, planId: params.plan_tier })
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || 'Failed to initialize Razorpay checkout order');
+    const responseText = await res.text();
+    let errorMessage = '';
+    try {
+      errorMessage = JSON.parse(responseText).error || '';
+    } catch {
+      errorMessage = responseText.replace(/<[^>]*>/g, '').trim();
+    }
+    throw new Error(errorMessage || `Checkout order request failed (${res.status})`);
   }
 
   return await res.json();
@@ -111,9 +119,10 @@ export async function verifyRazorpayPayment(params: {
   inventory_limit?: number;
   days?: number;
 }): Promise<{ success: boolean; subscription: any; message: string }> {
-  const res = await fetch('/api/razorpay/verify-payment', {
+  const res = await fetch('/api/payments/razorpay/verify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify(params)
   });
 

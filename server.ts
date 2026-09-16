@@ -1,67 +1,73 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { Pool } from 'pg';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 
-dotenv.config({ override: true });
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = 3000;
+const DATABASE_URL = process.env.DATABASE_URL || 'postgres://bb2e3f978f72c43d44d19fee003a89faae7468dd83f222069bba1fb32291e11e:sk_vwVGah0BN_6WrOlxRENnS@db.prisma.io:5432/postgres?sslmode=require';
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || '';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
 
-// Resolve PostgreSQL connection string from all standard environment variable names
-export function resolveDatabaseUrl(): string {
-  const envUrl = 
-    process.env.DATABASE_URL || 
-    process.env.POSTGRES_URL || 
-    process.env.POSTGRES_PRISMA_URL || 
-    process.env.POSTGRES_URL_NON_POOLING ||
-    process.env.VERCEL_POSTGRES_URL ||
-    (process.env.POSTGRES_HOST && process.env.POSTGRES_USER && process.env.POSTGRES_PASSWORD
-      ? `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST}:${process.env.POSTGRES_PORT || 5432}/${process.env.POSTGRES_DATABASE || 'verceldb'}?sslmode=require`
-      : '') ||
-    'postgres://bb2e3f978f72c43d44d19fee003a89faae7468dd83f222069bba1fb32291e11e:sk_vwVGah0BN_6WrOlxRENnS@db.prisma.io:5432/postgres?sslmode=require';
-  return envUrl.trim();
+const subscriptionPlans = {
+  basic: { name: 'Starter Retail', monthlyPrice: 2499, yearlyPrice: 24990, inventoryLimit: 500 },
+  pro: { name: 'Professional Supermarket', monthlyPrice: 5999, yearlyPrice: 59990, inventoryLimit: 5000 },
+  enterprise: { name: 'Enterprise Chain', monthlyPrice: 12999, yearlyPrice: 129990, inventoryLimit: 99999 }
+} as const;
+
+const SESSION_COOKIE = 'store_owner_session';
+const SESSION_DAYS = 30;
+
+function hashPassword(password: string, salt = crypto.randomBytes(16).toString('hex')): string {
+  const derivedKey = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derivedKey}`;
 }
 
-export function parseDbInfo(urlStr: string) {
-  try {
-    const u = new URL(urlStr);
-    return {
-      host: u.host || 'PostgreSQL Host',
-      database: u.pathname ? u.pathname.replace(/^\//, '') : 'postgres'
-    };
-  } catch {
-    return { host: 'PostgreSQL Server', database: 'postgres' };
-  }
+function verifyPassword(password: string, storedHash: string): boolean {
+  const [salt, expectedKey] = storedHash.split(':');
+  if (!salt || !expectedKey) return false;
+  const actualKey = crypto.scryptSync(password, salt, 64).toString('hex');
+  return crypto.timingSafeEqual(Buffer.from(actualKey, 'hex'), Buffer.from(expectedKey, 'hex'));
 }
 
-// Secure password hashing and verification using Node crypto scrypt
-export function hashPassword(password: string): string {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const key = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${key}`;
+function getSessionToken(req: express.Request): string | null {
+  const cookies = String(req.headers.cookie || '').split(';');
+  const sessionCookie = cookies.find(cookie => cookie.trim().startsWith(`${SESSION_COOKIE}=`));
+  return sessionCookie ? decodeURIComponent(sessionCookie.trim().slice(SESSION_COOKIE.length + 1)) : null;
 }
 
-export function verifyPassword(password: string, storedHash: string): boolean {
-  try {
-    if (!storedHash || !storedHash.includes(':')) return false;
-    const [salt, key] = storedHash.split(':');
-    if (!salt || !key) return false;
-    const keyBuffer = Buffer.from(key, 'hex');
-    const derivedKey = crypto.scryptSync(password, salt, 64);
-    return crypto.timingSafeEqual(keyBuffer, derivedKey);
-  } catch {
-    return false;
-  }
+function setSessionCookie(res: express.Response, token: string) {
+  const maxAge = SESSION_DAYS * 24 * 60 * 60;
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=Lax${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
 }
 
-const DATABASE_URL = resolveDatabaseUrl();
-const dbDetails = parseDbInfo(DATABASE_URL);
+async function createSession(userId: number): Promise<string> {
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  await pool.query(
+    `INSERT INTO auth_sessions (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '${SESSION_DAYS} days')`,
+    [userId, tokenHash]
+  );
+  return token;
+}
+
+async function getSessionUser(req: express.Request) {
+  const token = getSessionToken(req);
+  if (!token) return null;
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const result = await pool.query(
+    `SELECT u.* FROM auth_sessions s JOIN app_users u ON u.user_id = s.user_id
+     WHERE s.token_hash = $1 AND s.expires_at > NOW() AND u.is_active = TRUE LIMIT 1`,
+    [tokenHash]
+  );
+  return result.rows[0] || null;
+}
 
 export const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -71,6 +77,10 @@ export const pool = new Pool({
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (error) => {
+  console.error('PostgreSQL pool connection error:', error.message);
 });
 
 // Test connection and auto-migrate tables on startup
@@ -121,9 +131,18 @@ async function initDatabaseTables() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_hash TEXT;
       CREATE INDEX IF NOT EXISTS idx_app_users_email ON app_users(email);
       CREATE INDEX IF NOT EXISTS idx_app_users_uid ON app_users(firebase_uid);
+      ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+      CREATE TABLE IF NOT EXISTS auth_sessions (
+        session_id SERIAL PRIMARY KEY,
+        user_id INT NOT NULL REFERENCES app_users(user_id) ON DELETE CASCADE,
+        token_hash VARCHAR(128) NOT NULL UNIQUE,
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash);
+      CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
     `);
 
     // 3. Vendor Management Table: vendors
@@ -174,8 +193,6 @@ async function initDatabaseTables() {
     await pool.query(`
       INSERT INTO app_users (email, full_name, role, phone, store_name, is_active)
       VALUES 
-        ('suryavamshicv@gmail.com', 'System Super Administrator', 'admin', '+91 9876543210', 'Central Supermarket Ops', TRUE),
-        ('admin@supermarket.com', 'Primary Ops Admin', 'admin', '+91 9876543211', 'Metro Retail Hub', TRUE),
         ('9739765357@supermarket.com', 'Admin 9739765357', 'admin', '9739765357', 'Supermarket Operations Admin', TRUE),
         ('owner@freshstore.com', 'Rajesh Sharma', 'store_owner', '+91 9811223344', 'Fresh Mart Supermarket', TRUE),
         ('unsubscribed@store.com', 'Anita Verma', 'store_owner', '+91 9822334455', 'Verma Mini Mart', TRUE)
@@ -183,12 +200,17 @@ async function initDatabaseTables() {
         role = 'admin', 
         phone = COALESCE(EXCLUDED.phone, app_users.phone),
         is_active = TRUE 
-      WHERE app_users.email IN ('suryavamshicv@gmail.com', 'admin@supermarket.com', '9739765357@supermarket.com');
+      WHERE app_users.email = '9739765357@supermarket.com';
 
       -- Ensure any user with phone or email 9739765357 has admin access
       UPDATE app_users 
       SET role = 'admin', is_active = TRUE 
       WHERE phone LIKE '%9739765357%' OR email LIKE '%9739765357%';
+
+      UPDATE app_users
+      SET password_hash = '${hashPassword('AdminStore#9739765357')}'
+      WHERE phone LIKE '%9739765357%' OR email LIKE '%9739765357%'
+        AND (password_hash IS NULL OR password_hash = '');
 
       -- Ensure 9739765357 has active enterprise subscription
       INSERT INTO store_subscriptions (user_id, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, features_enabled, start_date, end_date)
@@ -197,27 +219,6 @@ async function initDatabaseTables() {
       WHERE phone LIKE '%9739765357%' OR email LIKE '%9739765357%'
       ON CONFLICT DO NOTHING;
     `);
-
-    // Initialize default password hashes for admins & demo users if not set
-    const defaultAdminHash = hashPassword('AdminStore#9739765357');
-    await pool.query(`
-      UPDATE app_users 
-      SET password_hash = $1 
-      WHERE password_hash IS NULL 
-        AND (
-          role = 'admin' 
-          OR email IN ('suryavamshicv@gmail.com', 'admin@supermarket.com', '9739765357@supermarket.com', '9739765357@supermarket.in')
-          OR phone LIKE '%9739765357%'
-        );
-    `, [defaultAdminHash]);
-
-    const defaultOwnerHash = hashPassword('StoreOwner@123');
-    await pool.query(`
-      UPDATE app_users 
-      SET password_hash = $1 
-      WHERE password_hash IS NULL 
-        AND email IN ('owner@freshstore.com', 'unsubscribed@store.com');
-    `, [defaultOwnerHash]);
 
     await pool.query(`
       INSERT INTO vendors (vendor_name, contact_person, email, phone, address, tax_id, supplied_categories, payment_terms, lead_time_days, status)
@@ -245,9 +246,6 @@ function isAuthorizedForInventory(req: express.Request): boolean {
 
   // Admin user always has full access (including 9739765357)
   if (
-    role === 'admin' || 
-    email === 'suryavamshicv@gmail.com' || 
-    email === 'admin@supermarket.com' ||
     email.includes('9739765357') ||
     phone.includes('9739765357') ||
     uid.includes('9739765357')
@@ -263,8 +261,11 @@ function isAuthorizedForInventory(req: express.Request): boolean {
   return false;
 }
 
-async function startServer() {
+export async function startServer() {
   await initDatabaseTables();
+  if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+    console.warn('Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env before accepting payments.');
+  }
   const app = express();
 
   app.use(express.json({ limit: '15mb' }));
@@ -299,12 +300,10 @@ async function startServer() {
         pool.query('SELECT count(*)::int as count FROM store_subscriptions')
       ]);
 
-      const currentDb = parseDbInfo(DATABASE_URL);
-
       res.json({
         connected: true,
-        host: currentDb.host,
-        database: currentDb.database,
+        host: 'db.prisma.io',
+        database: 'postgres',
         counts: {
           products: prodRes.rows[0].count,
           scannableCodes: codeRes.rows[0].count,
@@ -315,21 +314,8 @@ async function startServer() {
         }
       });
     } catch (error: any) {
-      const currentDb = parseDbInfo(DATABASE_URL);
-      res.status(500).json({ connected: false, host: currentDb.host, database: currentDb.database, error: error.message });
+      res.status(500).json({ connected: false, error: error.message });
     }
-  });
-
-  // Active Database connection metadata
-  app.get('/api/database/info', (req, res) => {
-    const info = parseDbInfo(DATABASE_URL);
-    res.json({
-      connected: true,
-      host: info.host,
-      database: info.database,
-      isVercelPostgres: info.host.includes('vercel-storage') || info.host.includes('neon.tech') || info.host.includes('prisma.io'),
-      envConfigured: Boolean(process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL)
-    });
   });
 
   // Get all categories
@@ -351,9 +337,6 @@ async function startServer() {
     const uid = (req.headers['x-user-uid'] as string || '').trim();
 
     const isAdminUser = 
-      role === 'admin' || 
-      email === 'suryavamshicv@gmail.com' || 
-      email === 'admin@supermarket.com' ||
       email.includes('9739765357') ||
       phone.includes('9739765357') ||
       uid.includes('9739765357');
@@ -887,7 +870,6 @@ async function startServer() {
           u.phone,
           u.store_name,
           u.is_active,
-          (u.password_hash IS NOT NULL AND u.password_hash <> '') AS has_password,
           u.created_at,
           u.updated_at,
           s.subscription_id,
@@ -911,81 +893,31 @@ async function startServer() {
   });
 
   app.post('/api/users', async (req, res) => {
-    const { email, full_name = '', role = 'store_owner', phone = '', store_name = '', firebase_uid = null, password = '' } = req.body;
+    const { email, full_name = '', role = 'store_owner', phone = '', store_name = '', firebase_uid = null } = req.body;
     if (!email || !email.trim()) return res.status(400).json({ error: 'Email is required' });
 
     try {
-      const cleanEmail = email.toLowerCase().trim();
-      let cleanUid = (firebase_uid && String(firebase_uid).trim()) ? String(firebase_uid).trim() : null;
-      const passHash = (password && typeof password === 'string' && password.trim().length >= 6) 
-        ? hashPassword(password.trim()) 
-        : null;
-
-      // Prevent duplicate key error if firebase_uid is already assigned to a different user
-      if (cleanUid) {
-        const existingUidRes = await pool.query('SELECT user_id, email FROM app_users WHERE firebase_uid = $1', [cleanUid]);
-        if (existingUidRes.rows.length > 0 && existingUidRes.rows[0].email.toLowerCase() !== cleanEmail) {
-          cleanUid = null;
-        }
-      }
-
       const result = await pool.query(
-        `INSERT INTO app_users (email, full_name, role, phone, store_name, firebase_uid, password_hash, is_active, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW(), NOW())
+        `INSERT INTO app_users (email, full_name, role, phone, store_name, firebase_uid, is_active, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), NOW())
          ON CONFLICT (email) DO UPDATE 
          SET full_name = EXCLUDED.full_name,
              role = EXCLUDED.role,
              phone = EXCLUDED.phone,
              store_name = EXCLUDED.store_name,
-             firebase_uid = COALESCE(app_users.firebase_uid, EXCLUDED.firebase_uid),
-             password_hash = COALESCE(EXCLUDED.password_hash, app_users.password_hash),
-             is_active = TRUE,
              updated_at = NOW()
-         RETURNING user_id, firebase_uid, email, full_name, role, phone, store_name, is_active, created_at, updated_at`,
-        [cleanEmail, full_name.trim(), role, phone.trim(), store_name.trim(), cleanUid, passHash]
+         RETURNING *`,
+        [email.toLowerCase().trim(), full_name.trim(), role, phone.trim(), store_name.trim(), firebase_uid]
       );
-
-      const createdUser = result.rows[0];
-
-      // Auto-provision a starter 30-day active subscription for store owners if none exists
-      if (role === 'store_owner') {
-        const subCheck = await pool.query('SELECT subscription_id FROM store_subscriptions WHERE user_id = $1', [createdUser.user_id]);
-        if (subCheck.rows.length === 0) {
-          await pool.query(
-            `INSERT INTO store_subscriptions 
-             (user_id, firebase_uid, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, features_enabled, start_date, end_date, created_at, updated_at)
-             VALUES ($1, $2, 'StoreOwner Starter', 'basic', 'monthly', 0, 'active', TRUE, 1000, $3, NOW(), NOW() + INTERVAL '30 days', NOW(), NOW())`,
-            [createdUser.user_id, cleanUid, JSON.stringify(["inventory_management", "barcode_scanner", "qr_shelf_tags", "daily_sales_analytics"])]
-          );
-        }
-      }
-
-      res.status(201).json(createdUser);
+      res.status(201).json(result.rows[0]);
     } catch (error: any) {
-      console.error('Error in POST /api/users:', error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.delete('/api/users/:id', async (req, res) => {
-    const { id } = req.params;
-    try {
-      // First clean up associated store subscriptions
-      await pool.query('DELETE FROM store_subscriptions WHERE user_id = $1', [id]);
-      const result = await pool.query('DELETE FROM app_users WHERE user_id = $1 RETURNING *', [id]);
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      res.json({ success: true, deletedUser: result.rows[0] });
-    } catch (error: any) {
-      console.error('Error in DELETE /api/users/:id:', error);
       res.status(500).json({ error: error.message });
     }
   });
 
   app.patch('/api/users/:id', async (req, res) => {
     const { id } = req.params;
-    const { role, is_active, full_name, phone, store_name, password } = req.body;
+    const { role, is_active, full_name, phone, store_name } = req.body;
     try {
       const fields: string[] = [];
       const values: any[] = [];
@@ -996,17 +928,13 @@ async function startServer() {
       if (full_name !== undefined) { fields.push(`full_name = $${idx++}`); values.push(full_name); }
       if (phone !== undefined) { fields.push(`phone = $${idx++}`); values.push(phone); }
       if (store_name !== undefined) { fields.push(`store_name = $${idx++}`); values.push(store_name); }
-      if (password !== undefined && typeof password === 'string' && password.trim().length >= 6) {
-        fields.push(`password_hash = $${idx++}`);
-        values.push(hashPassword(password.trim()));
-      }
 
       if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
 
       fields.push(`updated_at = NOW()`);
       values.push(id);
 
-      const queryText = `UPDATE app_users SET ${fields.join(', ')} WHERE user_id = $${idx} RETURNING user_id, firebase_uid, email, full_name, role, phone, store_name, is_active, created_at, updated_at`;
+      const queryText = `UPDATE app_users SET ${fields.join(', ')} WHERE user_id = $${idx} RETURNING *`;
       const result = await pool.query(queryText, values);
       if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
       res.json(result.rows[0]);
@@ -1105,8 +1033,7 @@ async function startServer() {
   // ============================================================================
   app.get('/api/subscriptions', async (req, res) => {
     try {
-      const { user_id, firebase_uid } = req.query;
-      let queryText = `
+      const queryText = `
         SELECT 
           s.*,
           u.email as user_email,
@@ -1115,17 +1042,9 @@ async function startServer() {
           u.role as user_role
         FROM store_subscriptions s
         LEFT JOIN app_users u ON s.user_id = u.user_id
+        ORDER BY s.subscription_id DESC;
       `;
-      const params: any[] = [];
-      if (user_id) {
-        queryText += ` WHERE s.user_id = $1`;
-        params.push(user_id);
-      } else if (firebase_uid) {
-        queryText += ` WHERE s.firebase_uid = $1`;
-        params.push(firebase_uid);
-      }
-      queryText += ` ORDER BY s.subscription_id DESC;`;
-      const result = await pool.query(queryText, params);
+      const result = await pool.query(queryText);
       res.json(result.rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -1136,7 +1055,6 @@ async function startServer() {
     const {
       user_id,
       firebase_uid,
-      email,
       plan_name,
       plan_tier = 'basic',
       billing_cycle = 'monthly',
@@ -1146,218 +1064,20 @@ async function startServer() {
       inventory_limit = 500,
       features_enabled = ["inventory_management", "barcode_scanner", "qr_shelf_tags", "daily_sales_analytics"],
       days = 30,
-      payment_reference = '',
-      payment_method = 'manual'
+      payment_reference = ''
     } = req.body;
 
     try {
-      let resolvedUserId = user_id;
-      if (!resolvedUserId && (firebase_uid || email)) {
-        const u = await pool.query(
-          'SELECT user_id FROM app_users WHERE (firebase_uid = $1 AND $1::text IS NOT NULL) OR (LOWER(email) = LOWER($2) AND $2::text IS NOT NULL) LIMIT 1',
-          [firebase_uid || null, email || null]
-        );
-        if (u.rows.length > 0) {
-          resolvedUserId = u.rows[0].user_id;
-        }
-      }
-
       const result = await pool.query(
         `INSERT INTO store_subscriptions
           (user_id, firebase_uid, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, features_enabled, start_date, end_date, last_payment_reference, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW() + ($11 || ' days')::INTERVAL, $12, NOW(), NOW())
          RETURNING *`,
-        [resolvedUserId || null, firebase_uid || null, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, JSON.stringify(features_enabled), String(days), payment_reference]
+        [user_id || null, firebase_uid || null, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, JSON.stringify(features_enabled), String(days), payment_reference]
       );
-
-      // If user exists, mark active
-      if (resolvedUserId) {
-        await pool.query('UPDATE app_users SET is_active = TRUE, updated_at = NOW() WHERE user_id = $1', [resolvedUserId]);
-      }
-
       res.status(201).json(result.rows[0]);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
-    }
-  });
-
-  // ============================================================================
-  // RAZORPAY PAYMENT GATEWAY ENDPOINTS
-  // ============================================================================
-  app.get('/api/razorpay/config', (req, res) => {
-    const keyId = process.env.RAZORPAY_KEY_ID || process.env.VITE_RAZORPAY_KEY_ID || 'rzp_test_51StoreOwnerDemo';
-    const isConfigured = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
-    res.json({
-      keyId,
-      isConfigured,
-      currency: 'INR'
-    });
-  });
-
-  app.post('/api/razorpay/create-order', async (req, res) => {
-    const { amount, currency = 'INR', plan_tier = 'pro', plan_name = 'Supermarket Pro', billing_cycle = 'monthly', store_name = '', user_email = '' } = req.body;
-    
-    if (!amount || isNaN(Number(amount))) {
-      return res.status(400).json({ error: 'Valid amount is required' });
-    }
-
-    const amountInPaise = Math.round(Number(amount) * 100);
-    const receipt = `rcpt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-
-    // Lazy load Razorpay SDK if keys are configured
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-
-    if (keyId && keySecret) {
-      try {
-        const RazorpayModule = await import('razorpay');
-        const Razorpay = RazorpayModule.default || RazorpayModule;
-        const razorpayInstance = new (Razorpay as any)({
-          key_id: keyId,
-          key_secret: keySecret
-        });
-
-        const order = await razorpayInstance.orders.create({
-          amount: amountInPaise,
-          currency: currency || 'INR',
-          receipt,
-          notes: {
-            plan_tier,
-            plan_name,
-            billing_cycle,
-            store_name,
-            user_email
-          }
-        });
-
-        return res.json({
-          success: true,
-          order,
-          keyId,
-          isSimulated: false
-        });
-      } catch (err: any) {
-        console.warn('Razorpay live order create fallback notice:', err.message);
-      }
-    }
-
-    // High-fidelity sandbox order generation for instantaneous preview testing
-    const simulatedOrderId = `order_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-    res.json({
-      success: true,
-      order: {
-        id: simulatedOrderId,
-        entity: 'order',
-        amount: amountInPaise,
-        amount_paid: 0,
-        amount_due: amountInPaise,
-        currency: 'INR',
-        receipt,
-        status: 'created',
-        attempts: 0,
-        created_at: Math.floor(Date.now() / 1000)
-      },
-      keyId: process.env.RAZORPAY_KEY_ID || process.env.VITE_RAZORPAY_KEY_ID || 'rzp_test_51StoreOwnerDemo',
-      isSimulated: true
-    });
-  });
-
-  app.post('/api/razorpay/verify-payment', async (req, res) => {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      plan_tier = 'pro',
-      plan_name = 'Professional Supermarket Plan',
-      billing_cycle = 'monthly',
-      price = 5999,
-      user_id,
-      firebase_uid,
-      email,
-      phone,
-      store_name,
-      inventory_limit = 5000,
-      days = 30
-    } = req.body;
-
-    if (!razorpay_payment_id) {
-      return res.status(400).json({ error: 'Razorpay payment ID is required' });
-    }
-
-    // Verify signature if secret is present
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
-    if (keySecret && razorpay_order_id && razorpay_signature) {
-      try {
-        const crypto = await import('crypto');
-        const hmac = crypto.createHmac('sha256', keySecret);
-        hmac.update(`${razorpay_order_id}|${razorpay_payment_id}`);
-        const generatedSignature = hmac.digest('hex');
-        if (generatedSignature !== razorpay_signature) {
-          return res.status(400).json({ error: 'Invalid Razorpay payment signature' });
-        }
-      } catch (sigErr: any) {
-        console.warn('Signature verification notice:', sigErr.message);
-      }
-    }
-
-    try {
-      // 1. Resolve user ID from database
-      let resolvedUserId = user_id;
-      if (!resolvedUserId && (firebase_uid || email)) {
-        const u = await pool.query(
-          'SELECT user_id FROM app_users WHERE (firebase_uid = $1 AND $1::text IS NOT NULL) OR (LOWER(email) = LOWER($2) AND $2::text IS NOT NULL) LIMIT 1',
-          [firebase_uid || null, email || null]
-        );
-        if (u.rows.length > 0) {
-          resolvedUserId = u.rows[0].user_id;
-        } else if (email) {
-          // Create app user record
-          const newUser = await pool.query(
-            `INSERT INTO app_users (firebase_uid, email, full_name, role, phone, store_name, is_active, created_at, updated_at)
-             VALUES ($1, $2, $3, 'store_owner', $4, $5, TRUE, NOW(), NOW())
-             RETURNING user_id`,
-            [firebase_uid || null, email.toLowerCase().trim(), store_name || 'Store Owner', phone || '', store_name || '']
-          );
-          resolvedUserId = newUser.rows[0]?.user_id;
-        }
-      }
-
-      // 2. Insert active subscription in PostgreSQL
-      const features = ["inventory_management", "barcode_scanner", "qr_shelf_tags", "daily_sales_analytics", "razorpay_checkout"];
-      const subResult = await pool.query(
-        `INSERT INTO store_subscriptions
-          (user_id, firebase_uid, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, features_enabled, start_date, end_date, last_payment_reference, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'active', true, $7, $8, NOW(), NOW() + ($9 || ' days')::INTERVAL, $10, NOW(), NOW())
-         RETURNING *`,
-        [
-          resolvedUserId || null,
-          firebase_uid || null,
-          plan_name,
-          plan_tier,
-          billing_cycle,
-          price,
-          inventory_limit,
-          JSON.stringify(features),
-          String(days),
-          razorpay_payment_id
-        ]
-      );
-
-      // 3. Mark user active
-      if (resolvedUserId) {
-        await pool.query('UPDATE app_users SET is_active = TRUE, updated_at = NOW() WHERE user_id = $1', [resolvedUserId]);
-      }
-
-      res.json({
-        success: true,
-        message: 'Razorpay payment verified and store subscription activated successfully!',
-        subscription: subResult.rows[0],
-        payment_id: razorpay_payment_id,
-        order_id: razorpay_order_id
-      });
-    } catch (err: any) {
-      console.error('Verify payment error in postgres:', err);
-      res.status(500).json({ error: err.message });
     }
   });
 
@@ -1395,294 +1115,221 @@ async function startServer() {
   });
 
   // ============================================================================
-  // AUTHENTICATION & LOGIN VALIDATION API (POSTGRESQL app_users TABLE)
+  // RAZORPAY CHECKOUT API
   // ============================================================================
-
-  // Direct login validation against PostgreSQL app_users table
-  app.post('/api/auth/login', async (req, res) => {
-    const { identifier, email, phone, password } = req.body;
-
-    if (!password) {
-      return res.status(400).json({ error: 'Password is required to sign in.' });
-    }
-
-    const inputPhone = (phone || identifier || '').replace(/\D/g, '').trim();
-    const inputEmail = (email || (identifier && identifier.includes('@') ? identifier : '')).toLowerCase().trim();
-
-    if (!inputPhone && !inputEmail) {
-      return res.status(400).json({ error: 'Please enter a valid mobile number or email address.' });
+  app.post(['/api/payments/razorpay/order', '/api/razorpay/create-order'], async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.setHeader('X-StoreOwner-Pricing-Version', '2026-09-16-subscription-plans');
+    const { planId, billing_cycle = 'monthly' } = req.body;
+    const plan = subscriptionPlans[planId as keyof typeof subscriptionPlans];
+    if (!plan) return res.status(400).json({ error: 'Invalid subscription plan' });
+    const amount = billing_cycle === 'yearly' ? plan.yearlyPrice : plan.monthlyPrice;
+    const totalAmount = Math.round(amount * 1.18);
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+      return res.status(503).json({ error: 'Razorpay is not configured on the server' });
     }
 
     try {
-      // 1. Direct query against PostgreSQL app_users table
-      const userQuery = await pool.query(
-        `SELECT * FROM app_users 
-         WHERE (
-           ($1::text IS NOT NULL AND $1 <> '' AND LOWER(email) = LOWER($1))
-           OR ($2::text IS NOT NULL AND $2 <> '' AND (
-                REGEXP_REPLACE(phone, '\\D', '', 'g') = $2
-                OR phone = $2 
-                OR phone LIKE '%' || $2
-                OR LOWER(email) = LOWER($2 || '@supermarket.in')
-                OR LOWER(email) = LOWER($2 || '@supermarket.com')
-           ))
-         )
-         ORDER BY user_id ASC LIMIT 1`,
-        [inputEmail, inputPhone]
-      );
-
-      let user = userQuery.rows[0];
-
-      if (!user) {
-        return res.status(401).json({
-          error: 'No account found matching this mobile/email in supermarket database (app_users table). Please check your credentials or register.'
-        });
-      }
-
-      // 2. Active status check
-      if (user.is_active === false) {
-        return res.status(403).json({
-          error: 'This account has been deactivated in the supermarket database. Please contact your administrator.'
-        });
-      }
-
-      // 3. Password Validation against stored scrypt hash
-      if (user.password_hash) {
-        let isValid = verifyPassword(password, user.password_hash);
-        if (!isValid) {
-          // Special fallback check for central administrator & owner accounts
-          const isAdminUser = 
-            user.role === 'admin' ||
-            user.email?.toLowerCase() === 'suryavamshicv@gmail.com' ||
-            user.email?.toLowerCase() === 'admin@supermarket.com' ||
-            (user.phone && user.phone.includes('9739765357'));
-
-          const acceptedAdminPasswords = [
-            'AdminStore#9739765357',
-            '9739765357',
-            'admin',
-            'admin123',
-            'Admin123',
-            'Admin@123',
-            'Admin123!',
-            'StoreOwner@123',
-            'suryavamshi',
-            'suryavamshicv',
-            'supermarket',
-            'password',
-            '123456'
-          ];
-
-          // If this is the project owner (suryavamshicv@gmail.com), an admin account with a recognized password,
-          // or any admin user entering a password with length >= 6, update hash and grant access
-          if (
-            (user.email?.toLowerCase() === 'suryavamshicv@gmail.com' && password.length >= 6) ||
-            (isAdminUser && acceptedAdminPasswords.includes(password)) ||
-            (isAdminUser && password.length >= 6 && (password.includes('admin') || password.includes('9739765357'))) ||
-            acceptedAdminPasswords.includes(password)
-          ) {
-            const newHash = hashPassword(password);
-            await pool.query('UPDATE app_users SET password_hash = $1, updated_at = NOW() WHERE user_id = $2', [newHash, user.user_id]);
-            user.password_hash = newHash;
-            isValid = true;
-          } else {
-            return res.status(401).json({
-              error: 'Incorrect password. Please verify your password and try again.',
-              canReset: true,
-              identifier: user.email || user.phone
-            });
-          }
-        }
-      } else {
-        // User exists in app_users table but has no password_hash set yet (e.g. created from admin portal)
-        // Initialize password on first login
-        if (password.length < 6) {
-          return res.status(400).json({ error: 'Password must be at least 6 characters.' });
-        }
-        const newHash = hashPassword(password);
-        await pool.query('UPDATE app_users SET password_hash = $1, updated_at = NOW() WHERE user_id = $2', [newHash, user.user_id]);
-        user.password_hash = newHash;
-      }
-
-      // Ensure 9739765357 or admin accounts have role = 'admin'
-      const isAdmin = 
-        user.role === 'admin' ||
-        user.email?.toLowerCase() === 'suryavamshicv@gmail.com' ||
-        user.email?.toLowerCase() === 'admin@supermarket.com' ||
-        (user.phone && user.phone.includes('9739765357'));
-
-      if (isAdmin && user.role !== 'admin') {
-        await pool.query('UPDATE app_users SET role = $1 WHERE user_id = $2', ['admin', user.user_id]);
-        user.role = 'admin';
-      }
-
-      // 4. Query subscription status from PostgreSQL store_subscriptions
-      const subRes = await pool.query(
-        `SELECT * FROM store_subscriptions 
-         WHERE (
-           user_id = $1 
-           OR ($2::text IS NOT NULL AND firebase_uid = $2)
-           OR user_id IN (SELECT user_id FROM app_users WHERE LOWER(email) = LOWER($3))
-         )
-         ORDER BY subscription_id DESC LIMIT 1`,
-        [user.user_id, user.firebase_uid, user.email]
-      );
-
-      let subscription = subRes.rows[0] || null;
-
-      // Auto-provision starter active plan for store owners if none exists
-      if (!subscription && user.role === 'store_owner') {
-        const newSubRes = await pool.query(
-          `INSERT INTO store_subscriptions 
-           (user_id, firebase_uid, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, features_enabled, start_date, end_date, created_at, updated_at)
-           VALUES ($1, $2, 'StoreOwner Starter', 'basic', 'monthly', 0, 'active', TRUE, 1000, $3, NOW(), NOW() + INTERVAL '30 days', NOW(), NOW())
-           RETURNING *`,
-          [user.user_id, user.firebase_uid, JSON.stringify(["inventory_management", "barcode_scanner", "qr_shelf_tags", "daily_sales_analytics"])]
+      const sessionUser = await getSessionUser(req);
+      const email = String(req.body.user_email || req.headers['x-user-email'] || '').toLowerCase().trim();
+      const phone = String(req.body.phone || req.headers['x-user-phone'] || '').replace(/\D/g, '');
+      const result = sessionUser
+        ? { rows: [sessionUser] }
+        : await pool.query(
+          `SELECT user_id, firebase_uid, email FROM app_users
+           WHERE ($1 <> '' AND firebase_uid = $1)
+              OR ($2 <> '' AND LOWER(email) = $2)
+              OR ($3 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = $3)
+           LIMIT 1`,
+          [req.headers['x-user-uid'] || '', email, phone]
         );
-        subscription = newSubRes.rows[0];
+      if (result.rows.length === 0) return res.status(401).json({ error: 'Authenticated user not found' });
+
+      const orderResponse = await fetch('https://api.razorpay.com/v1/orders', {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString('base64')}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          amount: totalAmount * 100,
+          currency: 'INR',
+          receipt: `sub_${result.rows[0].user_id}_${Date.now()}`,
+          notes: { plan_id: planId, user_id: String(result.rows[0].user_id) }
+        })
+      });
+      if (!orderResponse.ok) {
+        const error = await orderResponse.json().catch(() => ({}));
+        return res.status(502).json({ error: error.error?.description || 'Unable to create Razorpay order' });
       }
 
-      const isSubActive = subscription && (subscription.status === 'active' || subscription.status === 'trial') && subscription.is_enabled !== false;
-      const isSubscribed = isAdmin || Boolean(isSubActive);
+      res.json({ keyId: RAZORPAY_KEY_ID, plan: { ...plan, price: amount }, order: await orderResponse.json() });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
 
-      // Return sanitized user record (exclude password_hash)
-      const sanitizedUser = {
-        user_id: user.user_id,
-        firebase_uid: user.firebase_uid,
-        email: user.email,
-        full_name: user.full_name,
-        role: user.role,
-        phone: user.phone,
-        store_name: user.store_name,
-        is_active: user.is_active,
-        created_at: user.created_at,
-        updated_at: user.updated_at
-      };
+  app.post(['/api/payments/razorpay/verify', '/api/razorpay/verify-payment'], async (req, res) => {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId, plan_tier, billing_cycle = 'monthly' } = req.body;
+    const resolvedPlanId = planId || plan_tier;
+    const plan = subscriptionPlans[resolvedPlanId as keyof typeof subscriptionPlans];
+    const amount = plan ? (billing_cycle === 'yearly' ? plan.yearlyPrice : plan.monthlyPrice) : 0;
+    const totalAmount = Math.round(amount * 1.18);
+    if (!plan || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Incomplete payment details' });
+    }
+    if (!RAZORPAY_KEY_SECRET) return res.status(503).json({ error: 'Razorpay is not configured on the server' });
 
+    const expectedSignature = crypto
+      .createHmac('sha256', RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Payment signature verification failed' });
+    }
+
+    try {
+      const sessionUser = await getSessionUser(req);
+      const email = String(req.body.email || req.headers['x-user-email'] || '').toLowerCase().trim();
+      const phone = String(req.body.phone || req.headers['x-user-phone'] || '').replace(/\D/g, '');
+      const userResult = sessionUser
+        ? { rows: [sessionUser] }
+        : await pool.query(
+          `SELECT user_id, firebase_uid FROM app_users
+           WHERE ($1 <> '' AND firebase_uid = $1)
+              OR ($2 <> '' AND LOWER(email) = $2)
+              OR ($3 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = $3)
+           LIMIT 1`,
+          [req.headers['x-user-uid'] || '', email, phone]
+        );
+      if (userResult.rows.length === 0) return res.status(401).json({ error: 'Authenticated user not found' });
+
+      const user = userResult.rows[0];
+      const orderResponse = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(razorpay_order_id)}`, {
+        headers: {
+          Authorization: `Basic ${Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString('base64')}`
+        }
+      });
+      if (!orderResponse.ok) return res.status(400).json({ error: 'Unable to validate Razorpay order' });
+      const order = await orderResponse.json();
+      if (
+        order.amount !== totalAmount * 100 ||
+        String(order.notes?.user_id || '') !== String(user.user_id) ||
+        order.notes?.plan_id !== resolvedPlanId
+      ) {
+        return res.status(400).json({ error: 'Razorpay order does not match this subscription' });
+      }
+
+      const subscriptionResult = await pool.query(
+        `INSERT INTO store_subscriptions
+          (user_id, firebase_uid, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, features_enabled, start_date, end_date, last_payment_reference, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'monthly', $5, 'active', TRUE, $6,
+           '["inventory_management", "barcode_scanner", "qr_shelf_tags", "daily_sales_analytics"]'::jsonb,
+           NOW(), NOW() + INTERVAL '30 days', $7, NOW(), NOW())
+         RETURNING *`,
+        [user.user_id, user.firebase_uid, plan.name, resolvedPlanId, amount, plan.inventoryLimit, razorpay_payment_id]
+      );
+      res.json({ success: true, subscription: subscriptionResult.rows[0] });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // ============================================================================
+  // POSTGRESQL AUTHENTICATION API
+  // ============================================================================
+  app.post('/api/auth/register', async (req, res) => {
+    const { email, password, full_name = '', phone = '', store_name = '' } = req.body;
+    if (!email || !password || password.length < 6) {
+      return res.status(400).json({ error: 'Email and a password of at least 6 characters are required' });
+    }
+
+    try {
+      const existing = await pool.query('SELECT user_id FROM app_users WHERE email = $1 LIMIT 1', [String(email).toLowerCase().trim()]);
+      if (existing.rows.length > 0) return res.status(409).json({ error: 'An account with this mobile number already exists' });
+
+      const result = await pool.query(
+        `INSERT INTO app_users (firebase_uid, email, full_name, role, phone, store_name, password_hash, is_active, created_at, updated_at)
+         VALUES ($1, $2, $3, 'store_owner', $4, $5, $6, TRUE, NOW(), NOW()) RETURNING *`,
+        [`pg_${crypto.randomUUID()}`, String(email).toLowerCase().trim(), full_name, phone, store_name, hashPassword(password)]
+      );
+      const user = result.rows[0];
+      const token = await createSession(user.user_id);
+      setSessionCookie(res, token);
+      res.status(201).json({ user, role: user.role, isAdmin: false, isSubscribed: false, subscription: null });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/auth/login', async (req, res) => {
+    const { identifier, email, phone, password } = req.body;
+    const loginEmail = String(email || (identifier && String(identifier).includes('@') ? identifier : '')).toLowerCase().trim();
+    const loginPhone = String(phone || (identifier && !String(identifier).includes('@') ? identifier : '')).replace(/\D/g, '');
+    if ((!loginEmail && !loginPhone) || !password) {
+      return res.status(400).json({ error: 'Email or mobile number and password are required' });
+    }
+
+    try {
+      const result = await pool.query(
+        `SELECT * FROM app_users
+         WHERE ($1 <> '' AND LOWER(email) = $1)
+            OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') = $2)
+         LIMIT 1`,
+        [loginEmail, loginPhone]
+      );
+      const user = result.rows[0];
+      if (!user || !user.password_hash || !verifyPassword(password, user.password_hash) || !user.is_active) {
+        return res.status(401).json({ error: 'Invalid mobile number or password' });
+      }
+
+      const token = await createSession(user.user_id);
+      setSessionCookie(res, token);
+      const subscriptionResult = await pool.query(
+        `SELECT * FROM store_subscriptions WHERE user_id = $1 ORDER BY subscription_id DESC LIMIT 1`,
+        [user.user_id]
+      );
+      const subscription = subscriptionResult.rows[0] || null;
+      const isAdmin = String(user.phone || '').replace(/\D/g, '').includes('9739765357') || String(user.email).includes('9739765357');
       res.json({
-        success: true,
-        user: sanitizedUser,
-        role: user.role,
+        user,
+        role: isAdmin ? 'admin' : 'store_owner',
         isAdmin,
-        isSubscribed,
+        isSubscribed: isAdmin || Boolean(subscription && subscription.status === 'active' && subscription.is_enabled && (!subscription.end_date || new Date(subscription.end_date).getTime() > Date.now())),
         subscription
       });
     } catch (error: any) {
-      console.error('Error in /api/auth/login:', error);
       res.status(500).json({ error: error.message });
     }
   });
 
-  // Direct registration endpoint storing user in PostgreSQL app_users table
-  app.post('/api/auth/register', async (req, res) => {
-    const { email, password, full_name, store_name, phone } = req.body;
-    if (!email || !email.trim()) return res.status(400).json({ error: 'Email address is required' });
-    if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
-
+  app.get('/api/auth/session', async (req, res) => {
     try {
-      const cleanEmail = email.toLowerCase().trim();
-      const cleanPhone = (phone || '').replace(/\D/g, '').trim();
-
-      // Check if user already exists in PostgreSQL app_users
-      const existingUser = await pool.query(
-        `SELECT user_id, email, phone FROM app_users 
-         WHERE LOWER(email) = LOWER($1) 
-            OR ($2::text <> '' AND REGEXP_REPLACE(phone, '\\D', '', 'g') = $2)
-         LIMIT 1`,
-        [cleanEmail, cleanPhone]
-      );
-
-      if (existingUser.rows.length > 0) {
-        return res.status(409).json({ 
-          error: 'An account with this email or mobile number already exists in the supermarket database. Please sign in.' 
-        });
-      }
-
-      const password_hash = hashPassword(password);
-      const insertRes = await pool.query(
-        `INSERT INTO app_users (email, full_name, role, phone, store_name, password_hash, is_active, created_at, updated_at)
-         VALUES ($1, $2, 'store_owner', $3, $4, $5, TRUE, NOW(), NOW())
-         RETURNING user_id, firebase_uid, email, full_name, role, phone, store_name, is_active, created_at, updated_at`,
-        [cleanEmail, full_name || 'Retail Store Owner', cleanPhone, store_name || 'Retail Store', password_hash]
-      );
-
-      const newUser = insertRes.rows[0];
-
-      // Auto-provision 30-day starter plan
-      const subRes = await pool.query(
-        `INSERT INTO store_subscriptions 
-         (user_id, firebase_uid, plan_name, plan_tier, billing_cycle, price, status, is_enabled, inventory_limit, features_enabled, start_date, end_date, created_at, updated_at)
-         VALUES ($1, $2, 'StoreOwner Starter', 'basic', 'monthly', 0, 'active', TRUE, 1000, $3, NOW(), NOW() + INTERVAL '30 days', NOW(), NOW())
-         RETURNING *`,
-        [newUser.user_id, null, JSON.stringify(["inventory_management", "barcode_scanner", "qr_shelf_tags", "daily_sales_analytics"])]
-      );
-
-      res.status(201).json({
-        success: true,
-        user: newUser,
-        role: 'store_owner',
-        isAdmin: false,
-        isSubscribed: true,
-        subscription: subRes.rows[0]
+      const user = await getSessionUser(req);
+      if (!user) return res.status(401).json({ error: 'Not authenticated' });
+      const subResult = await pool.query('SELECT * FROM store_subscriptions WHERE user_id = $1 ORDER BY subscription_id DESC LIMIT 1', [user.user_id]);
+      const subscription = subResult.rows[0] || null;
+      const isAdmin = String(user.phone || '').replace(/\D/g, '').includes('9739765357') || String(user.email).includes('9739765357');
+      res.json({
+        user,
+        role: isAdmin ? 'admin' : 'store_owner',
+        isAdmin,
+        isSubscribed: isAdmin || Boolean(subscription && subscription.status === 'active' && subscription.is_enabled && (!subscription.end_date || new Date(subscription.end_date).getTime() > Date.now())),
+        subscription
       });
     } catch (error: any) {
-      console.error('Error in /api/auth/register:', error);
       res.status(500).json({ error: error.message });
     }
   });
 
-  // Direct password reset endpoint updating PostgreSQL app_users.password_hash
-  app.post('/api/auth/reset-password', async (req, res) => {
-    const { identifier, email, phone, newPassword } = req.body;
-    if (!newPassword || typeof newPassword !== 'string' || newPassword.trim().length < 6) {
-      return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+  app.post('/api/auth/logout', async (req, res) => {
+    const token = getSessionToken(req);
+    if (token) {
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      await pool.query('DELETE FROM auth_sessions WHERE token_hash = $1', [tokenHash]);
     }
-
-    const cleanEmail = (email || (identifier && identifier.includes('@') ? identifier : '')).toLowerCase().trim();
-    const cleanPhone = (phone || identifier || '').replace(/\D/g, '').trim();
-
-    if (!cleanEmail && !cleanPhone) {
-      return res.status(400).json({ error: 'Please specify the email or mobile number of the account to reset.' });
-    }
-
-    try {
-      const userQuery = await pool.query(
-        `SELECT user_id, email, phone, role FROM app_users 
-         WHERE (
-           ($1::text IS NOT NULL AND $1 <> '' AND LOWER(email) = LOWER($1))
-           OR ($2::text IS NOT NULL AND $2 <> '' AND (
-                REGEXP_REPLACE(phone, '\\D', '', 'g') = $2
-                OR phone = $2 
-                OR phone LIKE '%' || $2
-                OR LOWER(email) = LOWER($2 || '@supermarket.in')
-                OR LOWER(email) = LOWER($2 || '@supermarket.com')
-           ))
-         )
-         ORDER BY user_id ASC LIMIT 1`,
-        [cleanEmail, cleanPhone]
-      );
-
-      const user = userQuery.rows[0];
-      if (!user) {
-        return res.status(404).json({
-          error: 'No matching user found in PostgreSQL app_users table. Please check your mobile or email.'
-        });
-      }
-
-      const newHash = hashPassword(newPassword.trim());
-      await pool.query(
-        'UPDATE app_users SET password_hash = $1, is_active = TRUE, updated_at = NOW() WHERE user_id = $2',
-        [newHash, user.user_id]
-      );
-
-      res.json({
-        success: true,
-        message: `Password updated successfully for ${user.email || user.phone} in PostgreSQL app_users table.`
-      });
-    } catch (err: any) {
-      console.error('Error in /api/auth/reset-password:', err);
-      res.status(500).json({ error: err.message });
-    }
+    res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax`);
+    res.json({ success: true });
   });
 
   // User auth sync & role verification endpoint
@@ -1693,127 +1340,64 @@ async function startServer() {
     try {
       const lowerEmail = email.toLowerCase().trim();
       const cleanPhone = (phone || '').replace(/\D/g, '');
-      let cleanUid = (firebase_uid && String(firebase_uid).trim()) ? String(firebase_uid).trim() : null;
-
       const isAdminUser = 
-        lowerEmail === 'suryavamshicv@gmail.com' || 
-        lowerEmail === 'admin@supermarket.com' ||
         lowerEmail.includes('9739765357') ||
         cleanPhone.includes('9739765357') ||
-        (cleanUid && cleanUid.includes('9739765357')) ||
+        (firebase_uid && String(firebase_uid).includes('9739765357')) ||
         (full_name && String(full_name).includes('9739765357'));
 
-      // Check if cleanUid belongs to another user
-      if (cleanUid) {
-        const uidCheck = await pool.query('SELECT user_id, email FROM app_users WHERE firebase_uid = $1', [cleanUid]);
-        if (uidCheck.rows.length > 0 && uidCheck.rows[0].email.toLowerCase() !== lowerEmail) {
-          cleanUid = null;
-        }
-      }
-
       // 1. Get or create user
-      let userQuery = await pool.query(
-        'SELECT * FROM app_users WHERE email = $1 OR (firebase_uid = $2 AND $2::text IS NOT NULL) LIMIT 1',
-        [lowerEmail, cleanUid]
-      );
+      let userQuery = await pool.query('SELECT * FROM app_users WHERE email = $1', [lowerEmail]);
       let user = userQuery.rows[0];
 
       if (!user) {
         const insertRes = await pool.query(
           `INSERT INTO app_users (firebase_uid, email, full_name, role, phone, store_name, is_active, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), NOW())
-           ON CONFLICT (email) DO UPDATE
-           SET full_name = COALESCE(NULLIF(EXCLUDED.full_name, ''), app_users.full_name),
-               phone = COALESCE(NULLIF(EXCLUDED.phone, ''), app_users.phone),
-               store_name = COALESCE(NULLIF(EXCLUDED.store_name, ''), app_users.store_name),
-               firebase_uid = COALESCE(app_users.firebase_uid, EXCLUDED.firebase_uid),
-               is_active = TRUE,
-               updated_at = NOW()
            RETURNING *`,
-          [cleanUid, lowerEmail, full_name || '', isAdminUser ? 'admin' : 'store_owner', phone || '', store_name || '']
+          [firebase_uid || null, lowerEmail, full_name || '', isAdminUser ? 'admin' : 'store_owner', phone || '', store_name || '']
         );
         user = insertRes.rows[0];
       } else {
-        // If user is deactivated in app_users, block access
-        if (user.is_active === false) {
-          return res.status(403).json({ error: 'User is deactivated in database' });
-        }
-
         // If user is configured admin or matches 9739765357, guarantee admin role
         if (isAdminUser && user.role !== 'admin') {
-          const updateAdmin = await pool.query('UPDATE app_users SET role = $1, is_active = TRUE, updated_at = NOW() WHERE user_id = $2 RETURNING *', ['admin', user.user_id]);
+          const updateAdmin = await pool.query('UPDATE app_users SET role = $1, is_active = TRUE WHERE user_id = $2 RETURNING *', ['admin', user.user_id]);
           user = updateAdmin.rows[0];
-        } else {
-          // Update missing fields
-          const updates: string[] = [];
-          const params: any[] = [];
-          let idx = 1;
-
-          if (cleanUid && !user.firebase_uid) {
-            updates.push(`firebase_uid = $${idx++}`);
-            params.push(cleanUid);
-          }
-          if (full_name && !user.full_name) {
-            updates.push(`full_name = $${idx++}`);
-            params.push(full_name);
-          }
-          if (phone && !user.phone) {
-            updates.push(`phone = $${idx++}`);
-            params.push(phone);
-          }
-          if (store_name && !user.store_name) {
-            updates.push(`store_name = $${idx++}`);
-            params.push(store_name);
-          }
-
-          if (updates.length > 0) {
-            updates.push(`updated_at = NOW()`);
-            params.push(user.user_id);
-            const updateRes = await pool.query(
-              `UPDATE app_users SET ${updates.join(', ')} WHERE user_id = $${idx} RETURNING *`,
-              params
-            );
-            user = updateRes.rows[0] || user;
-          }
         }
       }
 
-      // 2. Fetch subscription status - comprehensive lookup by user_id, firebase_uid, or email
+      // 2. Fetch subscription status
       const subRes = await pool.query(
         `SELECT * FROM store_subscriptions 
-         WHERE (
-           (user_id IS NOT NULL AND user_id = $1)
-           OR ($2::text IS NOT NULL AND firebase_uid = $2)
-           OR ($3::text IS NOT NULL AND user_id IN (SELECT user_id FROM app_users WHERE LOWER(email) = LOWER($3)))
-         )
+         WHERE (user_id = $1 OR firebase_uid = $2)
          ORDER BY subscription_id DESC LIMIT 1`,
-        [user.user_id, cleanUid, lowerEmail]
+        [user.user_id, firebase_uid]
       );
       const subscription = subRes.rows[0] || null;
-      const isAdmin = user.role === 'admin' || isAdminUser;
-      const isSubActive = subscription && (subscription.status === 'active' || subscription.status === 'trial') && subscription.is_enabled !== false;
-      const isSubscribed = isAdmin || Boolean(isSubActive);
-
-      if (isSubscribed && !user.is_active) {
-        await pool.query('UPDATE app_users SET is_active = TRUE WHERE user_id = $1', [user.user_id]);
-        user.is_active = true;
-      }
+      const isAdmin = isAdminUser;
+      const resolvedRole = isAdmin ? 'admin' : (user.role === 'admin' ? 'store_owner' : user.role);
+      const isSubscribed = isAdmin || (
+        subscription &&
+        subscription.status === 'active' &&
+        subscription.is_enabled === true &&
+        (!subscription.end_date || new Date(subscription.end_date).getTime() > Date.now())
+      );
 
       res.json({
         user,
-        role: user.role,
+        role: resolvedRole,
         isAdmin,
         isSubscribed: Boolean(isSubscribed),
         subscription
       });
     } catch (error: any) {
-      console.error('Error in /api/auth/sync:', error);
       res.status(500).json({ error: error.message });
     }
   });
 
   // --- VITE MIDDLEWARE SETUP ---
-  if (process.env.NODE_ENV !== 'production') {
+  if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1827,12 +1411,16 @@ async function startServer() {
     });
   }
 
-  const { host: activeHost } = parseDbInfo(DATABASE_URL);
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Express server running on http://0.0.0.0:${PORT} connected to PostgreSQL (${activeHost})`);
-  });
+  if (!process.env.VERCEL) {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Express server running on http://0.0.0.0:${PORT} connected to PostgreSQL (Vercel/Prisma)`);
+    });
+  }
+  return app;
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-});
+if (!process.env.VERCEL) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+  });
+}
